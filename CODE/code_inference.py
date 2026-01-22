@@ -1,7 +1,6 @@
 import onnxruntime as ort
 import cv2
 import numpy as np
-import json
 import time
 import argparse
 from pathlib import Path
@@ -11,7 +10,7 @@ import os
 # ARGPARSE
 # ===============================
 def parse_args():
-    parser = argparse.ArgumentParser(description="YOLOv11 ONNX Video Inference")
+    parser = argparse.ArgumentParser(description="YOLOv11 ONNX Image Inference")
 
     parser.add_argument(
         "--model",
@@ -21,17 +20,17 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--video",
+        "--input",
         type=str,
         required=True,
-        help="Path to input video"
+        help="Path to input image or image folder"
     )
 
     parser.add_argument(
         "--output",
         type=str,
         required=True,
-        help="Output directory to save frames"
+        help="Output directory to save results"
     )
 
     parser.add_argument(
@@ -134,7 +133,7 @@ def draw_boxes(img, boxes, scores, class_ids):
         x1, y1, x2, y2 = box.astype(int)
         label = f"{COCO_CLASSES[cid]} {score:.2f}"
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(img, label, (x1, y1 - 5),
+        cv2.putText(img, label, (x1, max(y1 - 5, 0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 255, 0), 2)
     return img
@@ -147,38 +146,54 @@ def main():
     args = parse_args()
 
     model_path = args.model
-    video_path = args.video
+    input_path = Path(args.input)
     output_dir = Path(args.output)
     img_size = tuple(args.img_size)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("===== YOLOv11 ONNX VIDEO INFERENCE =====")
+    # Collect images
+    if input_path.is_dir():
+        image_list = sorted([
+            p for p in input_path.iterdir()
+            if p.suffix.lower() in [".jpg", ".png", ".jpeg"]
+        ])
+    else:
+        image_list = [input_path]
+
+    assert len(image_list) > 0, "❌ No input images found"
+
+    print("===== YOLOv11 ONNX IMAGE INFERENCE =====")
     print("Model :", model_path)
-    print("Video :", video_path)
+    print("Input :", input_path)
+    print("Images:", len(image_list))
     print("Output:", output_dir)
+
+    # Vitis AI config
+    vaip_config = "/usr/bin/vaip_config.json"
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.log_severity_level = 2
 
     session = ort.InferenceSession(
         model_path,
-        providers=["CPUExecutionProvider"]
+        sess_options=so,
+        providers=["VitisAIExecutionProvider"],
+        provider_options=[{"config_file": vaip_config}],
     )
 
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
 
-    cap = cv2.VideoCapture(video_path)
-    assert cap.isOpened(), "❌ Cannot open video"
-
-    frame_id = 0
     total_pre = total_inf = total_post = 0.0
     start_time = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_id += 1
+    for idx, img_path in enumerate(image_list, start=1):
+        frame = cv2.imread(str(img_path))
+        if frame is None:
+            print(f"❌ Cannot read image: {img_path}")
+            continue
 
         # Preprocess
         t0 = time.time()
@@ -201,24 +216,25 @@ def main():
         )
         t3 = time.time()
 
-        # Save
+        # Save result
         frame_draw = draw_boxes(frame, boxes, scores, class_ids)
-        cv2.imwrite(str(output_dir / f"frame_{frame_id:06d}.jpg"), frame_draw)
+        out_path = output_dir / img_path.name
+        cv2.imwrite(str(out_path), frame_draw)
 
         total_pre += (t1 - t0)
         total_inf += (t2 - t1)
         total_post += (t3 - t2)
 
-    cap.release()
     total_time = time.time() - start_time
+    num_imgs = len(image_list)
 
     print("\n========== SUMMARY ==========")
-    print(f"Frames         : {frame_id}")
+    print(f"Images         : {num_imgs}")
     print(f"Total time     : {total_time:.2f} s")
-    print(f"FPS            : {frame_id / total_time:.2f}")
-    print(f"Preprocess avg : {total_pre / frame_id * 1000:.2f} ms")
-    print(f"Inference avg  : {total_inf / frame_id * 1000:.2f} ms")
-    print(f"Postprocess avg: {total_post / frame_id * 1000:.2f} ms")
+    print(f"FPS            : {num_imgs / total_time:.2f}")
+    print(f"Preprocess avg : {total_pre / num_imgs * 1000:.2f} ms")
+    print(f"Inference avg  : {total_inf / num_imgs * 1000:.2f} ms")
+    print(f"Postprocess avg: {total_post / num_imgs * 1000:.2f} ms")
     print("=============================")
 
 
